@@ -17,11 +17,6 @@ def render_taster(token: str) -> None:
         )
         return
 
-    attrs = db.list_attributes(sess["product_id"])
-    if not attrs:
-        st.error("This tasting hasn't been set up yet (no questions configured).")
-        return
-
     st.title(f"🥤 {sess['name']}")
     st.markdown(
         "Welcome! Please taste each sample and fill in your impressions below. "
@@ -38,14 +33,23 @@ def render_taster(token: str) -> None:
         return
 
     sample_labels = [chr(ord("A") + i) for i in range(sess["num_samples"])]
-    tabs = st.tabs([f"Sample {L}" for L in sample_labels])
-    for tab, label in zip(tabs, sample_labels):
+    tab_labels = [db.sample_display_name(sess, L) for L in sample_labels]
+    tabs = st.tabs(tab_labels)
+    for tab, label, display in zip(tabs, sample_labels, tab_labels):
         with tab:
-            render_sample_form(sess, label, attrs, taster_name.strip())
+            product_id = db.get_sample_product_id(sess, label)
+            if not product_id:
+                st.error(f"Sample {label} has no product assigned. Ask the organizer to fix the session.")
+                continue
+            sample_attrs = db.list_attributes(product_id)
+            if not sample_attrs:
+                st.error(f"Sample {label}'s product has no questions configured.")
+                continue
+            render_sample_form(sess, label, sample_attrs, taster_name.strip(), display)
 
 
-def render_sample_form(sess, label: str, attrs, taster_name: str) -> None:
-    st.markdown(f"### 🍵 Sample {label}")
+def render_sample_form(sess, label: str, attrs, taster_name: str, display_name: str) -> None:
+    st.markdown(f"### 🍵 {display_name}")
     st.caption("Rate each aspect after tasting this sample.")
 
     submitted_key = f"submitted_{sess['id']}_{label}_{taster_name}"
@@ -103,13 +107,13 @@ def render_sample_form(sess, label: str, attrs, taster_name: str) -> None:
 
         st.write("")
 
-    if st.button(f"✅ Submit Sample {label}", key=f"sub_{sess['id']}_{label}", type="primary"):
+    if st.button(f"✅ Submit", key=f"sub_{sess['id']}_{label}", type="primary"):
         db.save_response(sess["id"], label, taster_name, answers)
         st.session_state[submitted_key] = True
-        st.success(f"Thanks! Your rating for Sample {label} is recorded.")
+        st.success(f"Thanks! Your rating for {display_name} is recorded.")
         st.balloons()
     elif st.session_state.get(submitted_key):
         st.info(
-            f"✓ You've already submitted Sample {label}. You can submit again to overwrite — "
+            f"✓ You've already submitted {display_name}. You can submit again to overwrite — "
             "we'll keep your most recent answer in the analytics."
         )

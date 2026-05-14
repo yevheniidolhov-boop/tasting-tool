@@ -215,9 +215,10 @@ def render_sessions_tab() -> None:
     st.markdown("### All sessions")
     for sess in sessions:
         status_emoji = "🟢" if sess["status"] == "open" else "🔒"
+        mode = "named" if sess.get("show_identities") else "blind"
         header = (
             f"{status_emoji} **{sess['name']}** · {sess['product_names_display']} · "
-            f"{sess['response_count']} responses from {sess['taster_count']} tasters"
+            f"{mode} · {sess['response_count']} responses from {sess['taster_count']} tasters"
         )
         with st.expander(header):
             render_session_row(sess)
@@ -239,6 +240,17 @@ def render_session_creator(products) -> None:
         prod_names,
         key="ns_default_prod",
         help="Used to pre-fill the per-sample product picker below. You can override each sample individually.",
+    )
+
+    show_identities = st.checkbox(
+        "Show real sample names to tasters",
+        value=True,
+        key="ns_show_id",
+        help=(
+            "ON (named) — tasters see the identity you type below (e.g. 'Batch 47 dark roast'). "
+            "OFF (blind) — tasters see only 'Sample A / B / C', identity is admin-only. "
+            "Use blind for unbiased batch comparisons."
+        ),
     )
 
     st.markdown("**Per-sample setup** (admin-only — tasters never see these names)")
@@ -271,7 +283,9 @@ def render_session_creator(products) -> None:
             st.error("Session name required.")
             return
         try:
-            sid, token = db.create_session(name.strip(), samples)
+            sid, token = db.create_session(
+                name.strip(), samples, show_identities=show_identities
+            )
             st.session_state["just_created_token"] = token
             st.success("Session created — share link is in the list below.")
             st.rerun()

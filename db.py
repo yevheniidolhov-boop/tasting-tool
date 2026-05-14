@@ -31,7 +31,8 @@ CREATE TABLE IF NOT EXISTS sessions (
     share_token TEXT NOT NULL UNIQUE,
     created_at TEXT NOT NULL DEFAULT (datetime('now')),
     closed_at TEXT,
-    sample_mapping TEXT NOT NULL DEFAULT '{}'
+    sample_mapping TEXT NOT NULL DEFAULT '{}',
+    show_identities INTEGER NOT NULL DEFAULT 1
 );
 CREATE TABLE IF NOT EXISTS responses (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -51,6 +52,12 @@ def init_db() -> None:
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     with get_conn() as conn:
         conn.executescript(SCHEMA)
+        try:
+            conn.execute(
+                "ALTER TABLE sessions ADD COLUMN show_identities INTEGER NOT NULL DEFAULT 1"
+            )
+        except sqlite3.OperationalError:
+            pass  # column already exists on freshly-created tables
     seed_defaults()
 
 
@@ -174,7 +181,7 @@ def _hydrate_session(d):
     return d
 
 
-def create_session(name, samples):
+def create_session(name, samples, show_identities=True):
     """samples: list of {'product_id': int, 'identity': str} in order A, B, C, ..."""
     if not samples:
         raise ValueError("Session must have at least one sample")
@@ -190,11 +197,28 @@ def create_session(name, samples):
         }
     with get_conn() as c:
         cur = c.execute(
-            "INSERT INTO sessions(name,product_id,num_samples,share_token,sample_mapping) "
-            "VALUES(?,?,?,?,?)",
-            (name, primary_product_id, num_samples, token, json.dumps(mapping)),
+            "INSERT INTO sessions(name,product_id,num_samples,share_token,sample_mapping,show_identities) "
+            "VALUES(?,?,?,?,?,?)",
+            (
+                name,
+                primary_product_id,
+                num_samples,
+                token,
+                json.dumps(mapping),
+                1 if show_identities else 0,
+            ),
         )
         return cur.lastrowid, token
+
+
+def sample_display_name(session, label, fallback_prefix="Sample"):
+    """What the taster sees as the sample's name. If the session is blind, returns 'Sample A'.
+    If named and identity is set, returns the identity. Otherwise falls back to 'Sample A'."""
+    if session.get("show_identities"):
+        identity = (get_sample_identity(session, label) or "").strip()
+        if identity:
+            return identity
+    return f"{fallback_prefix} {label}"
 
 
 def list_sessions():
