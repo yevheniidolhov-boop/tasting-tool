@@ -55,20 +55,28 @@ def render_analytics(session_id: int) -> None:
 
     present_samples = [L for L in sample_labels if L in df["sample"].unique()]
 
-    # ── Cross-sample comparison on shared attribute names ───────────────────
-    shared_attrs = _shared_attrs_across_samples(sample_attrs, present_samples)
-    shared_scale = [a for a in shared_attrs if a["type"] == "scale"]
+    # ── Cross-sample comparison (union of all attributes) ───────────────────
+    all_attrs = _union_attrs_across_samples(sample_attrs, present_samples)
+    all_scale = [a for a in all_attrs if a["type"] == "scale"]
 
-    if len(present_samples) >= 2 and shared_scale:
+    if present_samples:
         st.markdown("## Cross-sample comparison")
         st.caption(
-            "Attributes shared across the samples' products. "
-            "If samples use different products, only matching attribute names appear here."
+            "Every numeric attribute across every sample. "
+            "'—' means the sample's product doesn't include that attribute."
         )
-        _render_scale_table(df, shared_scale, present_samples)
-        if len(shared_scale) >= 3:
-            _render_radar(df, shared_scale, present_samples)
-        _render_ranking(df, shared_scale, present_samples, sess, sample_products)
+        if all_scale:
+            _render_scale_table(df, all_scale, present_samples, sess)
+        _render_ranking(df, sample_attrs, present_samples, sess, sample_products)
+
+    # ── Per-product charts ──────────────────────────────────────────────────
+    if present_samples:
+        st.markdown("## Per-product charts")
+        st.caption(
+            "Each product's samples plotted on that product's own attributes. "
+            "Useful when comparing batches/recipes of the same product."
+        )
+        _render_per_product_charts(df, sample_attrs, sample_products, sess, present_samples)
 
     # ── Per-sample detail ───────────────────────────────────────────────────
     st.markdown("## Per-sample breakdown")
@@ -147,77 +155,56 @@ def _build_dataframe(responses, sample_attrs):
     return pd.DataFrame(rows)
 
 
-def _shared_attrs_across_samples(sample_attrs, present_samples):
-    """Return attribute dicts whose name appears in every present sample's product, preserving order."""
-    if not present_samples:
-        return []
-    name_lists = [[a["name"] for a in sample_attrs[L]] for L in present_samples]
-    shared_names = set(name_lists[0])
-    for names in name_lists[1:]:
-        shared_names &= set(names)
-    # Preserve the order from the first sample
-    ordered_names = [n for n in name_lists[0] if n in shared_names]
-    by_name = OrderedDict()
-    for a in sample_attrs[present_samples[0]]:
-        if a["name"] in shared_names and a["name"] not in by_name:
-            by_name[a["name"]] = a
-    return [by_name[n] for n in ordered_names if n in by_name]
+def _union_attrs_across_samples(sample_attrs, present_samples):
+    """All unique attributes (by name) across present samples, in first-seen order."""
+    seen = set()
+    out = []
+    for L in present_samples:
+        for a in sample_attrs.get(L, []):
+            if a["name"] not in seen:
+                seen.add(a["name"])
+                out.append(a)
+    return out
 
 
-def _render_scale_table(df, scale_attrs, samples) -> None:
+def _sample_col(sess, label):
+    """Column label for a sample in cross-sample tables: 'A · Batch 47' or 'A'."""
+    display = db.sample_display_name(sess, label)
+    if display == f"Sample {label}":
+        return f"Sample {label}"
+    return f"{label} · {display}"
+
+
+def _render_scale_table(df, scale_attrs, samples, sess) -> None:
     st.markdown("#### Numeric scores — mean ± std (n)")
     agg_rows = []
     for a in scale_attrs:
         row = {"Attribute": a["name"]}
         for s in samples:
+            col = _sample_col(sess, s)
             if a["name"] not in df.columns:
-                row[f"Sample {s}"] = "—"
+                row[col] = "—"
                 continue
             vals = pd.to_numeric(df[df["sample"] == s][a["name"]], errors="coerce").dropna()
             if len(vals):
                 std = vals.std() if len(vals) > 1 else 0.0
-                row[f"Sample {s}"] = f"{vals.mean():.2f} ± {std:.2f}  (n={len(vals)})"
+                row[col] = f"{vals.mean():.2f} ± {std:.2f}  (n={len(vals)})"
             else:
-                row[f"Sample {s}"] = "—"
+                row[col] = "—"
         agg_rows.append(row)
     st.dataframe(pd.DataFrame(agg_rows), use_container_width=True, hide_index=True)
 
 
-def _render_radar(df, scale_attrs, samples) -> None:
-    st.markdown("#### Radar comparison")
-    fig = go.Figure()
-    categories = [a["name"] for a in scale_attrs]
-    for s in samples:
-        means = []
-        for a in scale_attrs:
-            if a["name"] not in df.columns:
-                means.append(0.0)
-                continue
-            vals = pd.to_numeric(df[df["sample"] == s][a["name"]], errors="coerce").dropna()
-            means.append(float(vals.mean()) if len(vals) else 0.0)
-        fig.add_trace(
-            go.Scatterpolar(
-                r=means + [means[0]],
-                theta=categories + [categories[0]],
-                fill="toself",
-                name=f"Sample {s}",
-            )
-        )
-    fig.update_layout(
-        polar=dict(radialaxis=dict(visible=True)),
-        showlegend=True,
-        height=500,
-        margin=dict(l=40, r=40, t=20, b=40),
-    )
-    st.plotly_chart(fig, use_container_width=True)
-
-
-def _render_ranking(df, scale_attrs, samples, sess, sample_products) -> None:
+def _render_ranking(df, sample_attrs, samples, sess, sample_products) -> None:
     st.markdown("#### Overall ranking")
-    st.caption("Average of shared numeric attributes per sample.")
+    st.caption(
+        "Each sample's overall score = average of ALL numeric ratings on its own product's attributes. "
+        "Higher = preferred."
+    )
     rank_rows = []
     for s in samples:
         sub = df[df["sample"] == s]
+        scale_attrs = [a for a in sample_attrs.get(s, []) if a["type"] == "scale"]
         all_vals = []
         for a in scale_attrs:
             if a["name"] not in sub.columns:
@@ -228,6 +215,7 @@ def _render_ranking(df, scale_attrs, samples, sess, sample_products) -> None:
             rank_rows.append(
                 {
                     "Sample": s,
+                    "Name": db.sample_display_name(sess, s),
                     "Product": prod["name"] if prod else "—",
                     "Identity": db.get_sample_identity(sess, s) or "—",
                     "Overall avg": round(sum(all_vals) / len(all_vals), 2),
@@ -238,6 +226,92 @@ def _render_ranking(df, scale_attrs, samples, sess, sample_products) -> None:
         rank_df = pd.DataFrame(rank_rows).sort_values("Overall avg", ascending=False).reset_index(drop=True)
         rank_df.insert(0, "Rank", range(1, len(rank_df) + 1))
         st.dataframe(rank_df, use_container_width=True, hide_index=True)
+
+
+def _render_per_product_charts(df, sample_attrs, sample_products, sess, present_samples) -> None:
+    """For each product in the session, plot a radar (or bar) chart with its samples."""
+    # Group samples by product id, preserving sample order
+    product_groups = OrderedDict()
+    for L in present_samples:
+        prod = sample_products.get(L)
+        if not prod:
+            continue
+        product_groups.setdefault(prod["id"], {"product": prod, "samples": []})["samples"].append(L)
+
+    if not product_groups:
+        st.caption("_No products linked to samples._")
+        return
+
+    for pid, info in product_groups.items():
+        prod = info["product"]
+        samples = info["samples"]
+        attrs = sample_attrs[samples[0]]
+        scale_attrs = [a for a in attrs if a["type"] == "scale"]
+
+        st.markdown(f"### {prod['name']}")
+        sample_summary = ", ".join(
+            f"Sample {L} ({db.sample_display_name(sess, L)})" for L in samples
+        )
+        st.caption(f"{len(samples)} sample(s): {sample_summary}")
+
+        if not scale_attrs:
+            st.caption("_No numeric attributes on this product — nothing to chart._")
+            continue
+
+        # Mean per (sample, attribute) for this product
+        means_table = []
+        for L in samples:
+            row = {"Sample": db.sample_display_name(sess, L), "_label": L}
+            for a in scale_attrs:
+                if a["name"] in df.columns:
+                    vals = pd.to_numeric(df[df["sample"] == L][a["name"]], errors="coerce").dropna()
+                    row[a["name"]] = float(vals.mean()) if len(vals) else None
+                else:
+                    row[a["name"]] = None
+            means_table.append(row)
+        means_df = pd.DataFrame(means_table)
+
+        if len(scale_attrs) >= 3:
+            fig = go.Figure()
+            categories = [a["name"] for a in scale_attrs]
+            for row in means_table:
+                rvals = [row[c] if row[c] is not None else 0.0 for c in categories]
+                fig.add_trace(
+                    go.Scatterpolar(
+                        r=rvals + [rvals[0]],
+                        theta=categories + [categories[0]],
+                        fill="toself",
+                        name=row["Sample"],
+                    )
+                )
+            fig.update_layout(
+                polar=dict(radialaxis=dict(visible=True)),
+                showlegend=True,
+                height=450,
+                margin=dict(l=40, r=40, t=20, b=40),
+            )
+            st.plotly_chart(fig, use_container_width=True, key=f"radar_{pid}")
+        else:
+            # Grouped bar chart
+            fig = go.Figure()
+            for row in means_table:
+                fig.add_trace(
+                    go.Bar(
+                        x=[a["name"] for a in scale_attrs],
+                        y=[row[a["name"]] if row[a["name"]] is not None else 0 for a in scale_attrs],
+                        name=row["Sample"],
+                    )
+                )
+            fig.update_layout(barmode="group", height=350, margin=dict(l=40, r=40, t=20, b=40))
+            st.plotly_chart(fig, use_container_width=True, key=f"bar_{pid}")
+
+        # Compact table under the chart
+        display_df = means_df.drop(columns=["_label"]).copy()
+        for c in display_df.columns:
+            if c == "Sample":
+                continue
+            display_df[c] = display_df[c].apply(lambda v: f"{v:.2f}" if pd.notna(v) else "—")
+        st.dataframe(display_df, use_container_width=True, hide_index=True)
 
 
 def _render_sample_detail(sample_df, attrs) -> None:
@@ -307,10 +381,56 @@ def _build_excel_report(sess, sample_attrs, sample_products, df, present_samples
     buf = io.BytesIO()
     with pd.ExcelWriter(buf, engine="openpyxl") as writer:
         _write_summary_sheet(writer, sess, sample_attrs, sample_products, df, present_samples, all_samples)
+        _write_per_product_sheets(writer, sess, sample_attrs, sample_products, df, present_samples)
         for L in all_samples:
             _write_sample_sheet(writer, L, sess, sample_attrs[L], sample_products.get(L), df[df["sample"] == L])
         df.to_excel(writer, sheet_name="Raw responses", index=False)
     return buf.getvalue()
+
+
+def _write_per_product_sheets(writer, sess, sample_attrs, sample_products, df, present_samples):
+    """One sheet per product, showing per-sample means for that product's attributes."""
+    product_groups = OrderedDict()
+    for L in present_samples:
+        prod = sample_products.get(L)
+        if not prod:
+            continue
+        product_groups.setdefault(prod["id"], {"product": prod, "samples": []})["samples"].append(L)
+
+    for pid, info in product_groups.items():
+        prod = info["product"]
+        samples = info["samples"]
+        attrs = sample_attrs[samples[0]]
+        scale_attrs = [a for a in attrs if a["type"] == "scale"]
+        sheet = f"Product · {prod['name']}"[:31]
+        row = 0
+
+        meta = pd.DataFrame([
+            {"Field": "Product", "Value": prod["name"]},
+            {"Field": "Samples in session", "Value": ", ".join(samples)},
+            {"Field": "Numeric attributes", "Value": len(scale_attrs)},
+        ])
+        row = _write_block(writer, sheet, row, f"Product: {prod['name']}", meta)
+
+        if not scale_attrs:
+            continue
+
+        # Per-sample means table (samples as rows, attributes as columns)
+        rows = []
+        for L in samples:
+            r = {
+                "Sample": L,
+                "Name": db.sample_display_name(sess, L),
+                "Identity": db.get_sample_identity(sess, L) or "—",
+            }
+            for a in scale_attrs:
+                if a["name"] in df.columns:
+                    vals = pd.to_numeric(df[df["sample"] == L][a["name"]], errors="coerce").dropna()
+                    r[a["name"]] = round(float(vals.mean()), 2) if len(vals) else None
+                else:
+                    r[a["name"]] = None
+            rows.append(r)
+        row = _write_block(writer, sheet, row, "Per-sample means", pd.DataFrame(rows))
 
 
 def _write_block(writer, sheet, start_row, title, data):
@@ -352,15 +472,21 @@ def _write_summary_sheet(writer, sess, sample_attrs, sample_products, df, presen
         })
     row = _write_block(writer, sheet, row, "Sample identities (admin only)", pd.DataFrame(ident_rows))
 
-    shared_attrs = _shared_attrs_across_samples(sample_attrs, present_samples)
-    shared_scale = [a for a in shared_attrs if a["type"] == "scale"]
+    all_attrs = _union_attrs_across_samples(sample_attrs, present_samples)
+    all_scale = [a for a in all_attrs if a["type"] == "scale"]
 
-    if shared_scale and present_samples:
+    if all_scale and present_samples:
         comp_rows = []
-        for a in shared_scale:
+        for a in all_scale:
             r = {"Attribute": a["name"]}
             for s in present_samples:
-                vals = pd.to_numeric(df[df["sample"] == s].get(a["name"], pd.Series(dtype=float)), errors="coerce").dropna()
+                sample_attr_names = {at["name"] for at in sample_attrs.get(s, [])}
+                if a["name"] not in sample_attr_names or a["name"] not in df.columns:
+                    r[f"Sample {s} mean"] = None
+                    r[f"Sample {s} std"] = None
+                    r[f"Sample {s} n"] = None
+                    continue
+                vals = pd.to_numeric(df[df["sample"] == s][a["name"]], errors="coerce").dropna()
                 if len(vals):
                     std = vals.std() if len(vals) > 1 else 0.0
                     r[f"Sample {s} mean"] = round(float(vals.mean()), 2)
@@ -371,19 +497,22 @@ def _write_summary_sheet(writer, sess, sample_attrs, sample_products, df, presen
                     r[f"Sample {s} std"] = None
                     r[f"Sample {s} n"] = 0
             comp_rows.append(r)
-        row = _write_block(writer, sheet, row, "Cross-sample numeric comparison", pd.DataFrame(comp_rows))
+        row = _write_block(writer, sheet, row, "Cross-sample numeric comparison (all attributes)", pd.DataFrame(comp_rows))
 
+    if present_samples:
         rank_rows = []
         for s in present_samples:
             sub = df[df["sample"] == s]
+            sample_scale = [a for a in sample_attrs.get(s, []) if a["type"] == "scale"]
             vals_all = []
-            for a in shared_scale:
+            for a in sample_scale:
                 if a["name"] in sub.columns:
                     vals_all.extend(pd.to_numeric(sub[a["name"]], errors="coerce").dropna().tolist())
             if vals_all:
                 prod = sample_products.get(s)
                 rank_rows.append({
                     "Sample": s,
+                    "Name": db.sample_display_name(sess, s),
                     "Product": prod["name"] if prod else "—",
                     "Identity": db.get_sample_identity(sess, s) or "—",
                     "Overall avg": round(sum(vals_all) / len(vals_all), 2),
