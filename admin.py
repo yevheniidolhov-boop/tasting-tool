@@ -54,11 +54,20 @@ def render_products_tab() -> None:
     with st.expander("➕ Add new product"):
         new_name = st.text_input("Product name", key="np_name", placeholder="e.g. Mushroom Coffee")
         new_cat = st.text_input("Category", key="np_cat", placeholder="e.g. coffee / cocoa / creamer")
+        seed_attrs = st.checkbox(
+            "Pre-fill with the default attribute set (Aroma, Flavor, Mouthfeel, JAR scales, Off-notes, Overall liking, Comments)",
+            value=True,
+            key="np_seed",
+        )
         if st.button("Create product", key="np_btn", type="primary"):
             if new_name.strip():
                 try:
-                    db.create_product(new_name.strip(), new_cat.strip() or None)
-                    st.success(f"Created '{new_name}'.")
+                    pid = db.create_product(new_name.strip(), new_cat.strip() or None)
+                    if seed_attrs:
+                        db.seed_default_attributes(pid)
+                        st.success(f"Created '{new_name}' with the default attribute set.")
+                    else:
+                        st.success(f"Created '{new_name}' (no attributes — add them below).")
                     st.rerun()
                 except Exception as e:
                     st.error(f"Failed: {e}")
@@ -207,7 +216,7 @@ def render_sessions_tab() -> None:
     for sess in sessions:
         status_emoji = "🟢" if sess["status"] == "open" else "🔒"
         header = (
-            f"{status_emoji} **{sess['name']}** · {sess['product_name']} · "
+            f"{status_emoji} **{sess['name']}** · {sess['product_names_display']} · "
             f"{sess['response_count']} responses from {sess['taster_count']} tasters"
         )
         with st.expander(header):
@@ -218,33 +227,56 @@ def render_session_creator(products) -> None:
     name = st.text_input(
         "Session name (shown to tasters)",
         key="ns_name",
-        placeholder="e.g. Coffee batch comparison",
+        placeholder="e.g. Coffee batch comparison · or · Coffee vs Cocoa vs Creamer",
     )
-    prod_options = {p["name"]: p["id"] for p in products}
-    prod_name = st.selectbox("Product (determines the questions)", list(prod_options.keys()), key="ns_prod")
     num = int(st.number_input("Number of samples", min_value=1, max_value=26, value=3, step=1, key="ns_num"))
 
-    st.caption(
-        "Sample identity mapping (**admin-only — never shown to tasters**). "
-        "Tasters see only 'Sample A', 'Sample B', etc."
+    prod_options = {p["name"]: p["id"] for p in products}
+    prod_names = list(prod_options.keys())
+
+    default_product = st.selectbox(
+        "Default product for new samples",
+        prod_names,
+        key="ns_default_prod",
+        help="Used to pre-fill the per-sample product picker below. You can override each sample individually.",
     )
-    mapping = {}
+
+    st.markdown("**Per-sample setup** (admin-only — tasters never see these names)")
+    st.caption(
+        "Pick the product behind each Sample letter. Different products = different question sets. "
+        "Use the same product for all samples to compare batches of one product."
+    )
+
+    samples = []
     for i in range(num):
         L = chr(ord("A") + i)
-        mapping[L] = st.text_input(
-            f"Sample {L} =",
-            key=f"ns_map_{L}",
-            placeholder="e.g. Batch 47 dark roast",
-        )
+        c1, c2 = st.columns([1, 2])
+        with c1:
+            picked = st.selectbox(
+                f"Sample {L} product",
+                prod_names,
+                index=prod_names.index(default_product),
+                key=f"ns_prod_{L}",
+            )
+        with c2:
+            identity = st.text_input(
+                f"Sample {L} identity",
+                key=f"ns_id_{L}",
+                placeholder="e.g. Batch 47 dark roast",
+            )
+        samples.append({"product_id": prod_options[picked], "identity": identity})
 
     if st.button("🚀 Create session", key="ns_btn", type="primary"):
         if not name.strip():
             st.error("Session name required.")
-        else:
-            sid, token = db.create_session(name.strip(), prod_options[prod_name], num, mapping)
+            return
+        try:
+            sid, token = db.create_session(name.strip(), samples)
             st.session_state["just_created_token"] = token
             st.success("Session created — share link is in the list below.")
             st.rerun()
+        except Exception as e:
+            st.error(f"Failed: {e}")
 
 
 def render_session_row(sess) -> None:
@@ -254,9 +286,13 @@ def render_session_row(sess) -> None:
     st.code(share_url, language=None)
 
     if sess["sample_mapping"]:
+        products = {p["id"]: p["name"] for p in db.list_products()}
         with st.expander("🔑 Sample identities (admin only)", expanded=False):
-            for L, identity in sess["sample_mapping"].items():
-                st.markdown(f"- **Sample {L}** → {identity or '_unspecified_'}")
+            for L in sorted(sess["sample_mapping"].keys()):
+                info = sess["sample_mapping"][L]
+                pname = products.get(info.get("product_id"), "?")
+                identity = info.get("identity") or "_unspecified_"
+                st.markdown(f"- **Sample {L}** · _{pname}_ → {identity}")
 
     c1, c2, c3 = st.columns(3)
     if sess["status"] == "open":
@@ -283,7 +319,7 @@ def render_results_tab() -> None:
         return
 
     options = {
-        f"{'🟢' if s['status']=='open' else '🔒'}  {s['name']}  ·  {s['product_name']}  ({s['response_count']} resp.)": s["id"]
+        f"{'🟢' if s['status']=='open' else '🔒'}  {s['name']}  ·  {s['product_names_display']}  ({s['response_count']} resp.)": s["id"]
         for s in sessions
     }
     label = st.selectbox("Pick a session", list(options.keys()), key="res_select")

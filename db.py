@@ -134,14 +134,65 @@ def delete_attribute(attr_id):
 
 
 # ── Sessions ─────────────────────────────────────────────────────────────────
+#
+# samples is a list of dicts: [{"label": "A", "product_id": int, "identity": str}, ...]
+# Stored in sample_mapping as: {"A": {"product_id": int, "identity": str}, ...}
+# Legacy format {"A": "identity string"} is normalized on read.
 
-def create_session(name, product_id, num_samples, sample_mapping):
+def _normalize_mapping(mapping, fallback_product_id, num_samples):
+    if not isinstance(mapping, dict):
+        mapping = {}
+    out = {}
+    for label, val in mapping.items():
+        if isinstance(val, dict):
+            out[label] = {
+                "product_id": val.get("product_id") or fallback_product_id,
+                "identity": val.get("identity", "") or "",
+            }
+        else:
+            out[label] = {
+                "product_id": fallback_product_id,
+                "identity": str(val) if val else "",
+            }
+    for i in range(num_samples):
+        L = chr(ord("A") + i)
+        if L not in out:
+            out[L] = {"product_id": fallback_product_id, "identity": ""}
+    return out
+
+
+def _hydrate_session(d):
+    raw = json.loads(d["sample_mapping"]) if d["sample_mapping"] else {}
+    d["sample_mapping"] = _normalize_mapping(raw, d.get("product_id"), d["num_samples"])
+    # Build distinct product list referenced by samples
+    product_ids = []
+    for v in d["sample_mapping"].values():
+        pid = v["product_id"]
+        if pid and pid not in product_ids:
+            product_ids.append(pid)
+    d["sample_product_ids"] = product_ids
+    return d
+
+
+def create_session(name, samples):
+    """samples: list of {'product_id': int, 'identity': str} in order A, B, C, ..."""
+    if not samples:
+        raise ValueError("Session must have at least one sample")
     token = secrets.token_urlsafe(8)
+    num_samples = len(samples)
+    primary_product_id = samples[0]["product_id"]
+    mapping = {}
+    for i, s in enumerate(samples):
+        L = chr(ord("A") + i)
+        mapping[L] = {
+            "product_id": s["product_id"],
+            "identity": s.get("identity", "") or "",
+        }
     with get_conn() as c:
         cur = c.execute(
             "INSERT INTO sessions(name,product_id,num_samples,share_token,sample_mapping) "
             "VALUES(?,?,?,?,?)",
-            (name, product_id, num_samples, token, json.dumps(sample_mapping)),
+            (name, primary_product_id, num_samples, token, json.dumps(mapping)),
         )
         return cur.lastrowid, token
 
@@ -150,47 +201,53 @@ def list_sessions():
     with get_conn() as c:
         rows = c.execute(
             """
-            SELECT s.*, p.name AS product_name,
+            SELECT s.*,
                    (SELECT COUNT(DISTINCT taster_name) FROM responses WHERE session_id=s.id) AS taster_count,
                    (SELECT COUNT(*) FROM responses WHERE session_id=s.id) AS response_count
-            FROM sessions s JOIN products p ON p.id=s.product_id
+            FROM sessions s
             ORDER BY s.created_at DESC
             """
         ).fetchall()
     out = []
     for r in rows:
         d = dict(r)
-        d["sample_mapping"] = json.loads(d["sample_mapping"]) if d["sample_mapping"] else {}
+        _hydrate_session(d)
         out.append(d)
+    # attach product names per session
+    products = {p["id"]: p["name"] for p in list_products()}
+    for d in out:
+        names = [products.get(pid, "?") for pid in d["sample_product_ids"]]
+        d["product_names"] = names
+        d["product_names_display"] = ", ".join(names) if names else "—"
     return out
 
 
 def get_session(session_id):
     with get_conn() as c:
-        r = c.execute(
-            "SELECT s.*, p.name AS product_name FROM sessions s "
-            "JOIN products p ON p.id=s.product_id WHERE s.id=?",
-            (session_id,),
-        ).fetchone()
+        r = c.execute("SELECT * FROM sessions WHERE id=?", (session_id,)).fetchone()
     if not r:
         return None
-    d = dict(r)
-    d["sample_mapping"] = json.loads(d["sample_mapping"]) if d["sample_mapping"] else {}
-    return d
+    return _hydrate_session(dict(r))
 
 
 def get_session_by_token(token):
     with get_conn() as c:
-        r = c.execute(
-            "SELECT s.*, p.name AS product_name FROM sessions s "
-            "JOIN products p ON p.id=s.product_id WHERE s.share_token=?",
-            (token,),
-        ).fetchone()
+        r = c.execute("SELECT * FROM sessions WHERE share_token=?", (token,)).fetchone()
     if not r:
         return None
-    d = dict(r)
-    d["sample_mapping"] = json.loads(d["sample_mapping"]) if d["sample_mapping"] else {}
-    return d
+    return _hydrate_session(dict(r))
+
+
+def get_sample_product_id(session, label):
+    info = session["sample_mapping"].get(label)
+    if info:
+        return info.get("product_id") or session.get("product_id")
+    return session.get("product_id")
+
+
+def get_sample_identity(session, label):
+    info = session["sample_mapping"].get(label) or {}
+    return info.get("identity", "")
 
 
 def close_session(session_id):
@@ -255,74 +312,87 @@ LIKING_SCALE = {
     "high_label": "Like extremely",
 }
 
-DEFAULT_PRODUCTS = [
+DEFAULT_ATTRIBUTES = [
     {
-        "name": "Coffee",
-        "category": "coffee",
-        "attributes": [
-            {
-                "name": "Aroma — overall liking",
-                "type": "scale",
-                "config": LIKING_SCALE,
-            },
-            {
-                "name": "Flavor — overall liking",
-                "type": "scale",
-                "config": LIKING_SCALE,
-            },
-            {
-                "name": "Mouthfeel / body",
-                "type": "scale",
-                "config": {
-                    "min": 1,
-                    "max": 10,
-                    "low_label": "Thin / unpleasant",
-                    "high_label": "Rich / pleasant",
-                },
-            },
-            {
-                "name": "Sweetness (JAR)",
-                "type": "select",
-                "config": {
-                    "options": JAR_OPTIONS,
-                    "description": "Just-About-Right scale — 3 means perfectly balanced.",
-                },
-            },
-            {
-                "name": "Bitterness / earthiness (JAR)",
-                "type": "select",
-                "config": {
-                    "options": JAR_OPTIONS,
-                    "description": "Just-About-Right scale — 3 means perfectly balanced.",
-                },
-            },
-            {
-                "name": "Off-notes detected?",
-                "type": "select",
-                "config": {"options": ["No", "Yes"]},
-            },
-            {
-                "name": "Off-notes — describe (if any)",
-                "type": "text",
-                "config": {
-                    "description": "e.g. metallic, cardboard, rancid, dusty, sour, soapy",
-                },
-            },
-            {
-                "name": "Overall liking",
-                "type": "scale",
-                "config": LIKING_SCALE,
-            },
-            {
-                "name": "Comments / improvement direction",
-                "type": "text",
-                "config": {
-                    "description": "Specific notes on aroma, flavor profile, finish, suggested tweaks.",
-                },
-            },
-        ],
+        "name": "Aroma — overall liking",
+        "type": "scale",
+        "config": LIKING_SCALE,
+    },
+    {
+        "name": "Flavor — overall liking",
+        "type": "scale",
+        "config": LIKING_SCALE,
+    },
+    {
+        "name": "Mouthfeel / body",
+        "type": "scale",
+        "config": {
+            "min": 1,
+            "max": 10,
+            "low_label": "Thin / unpleasant",
+            "high_label": "Rich / pleasant",
+        },
+    },
+    {
+        "name": "Sweetness (JAR)",
+        "type": "select",
+        "config": {
+            "options": JAR_OPTIONS,
+            "description": "Just-About-Right scale — 3 means perfectly balanced.",
+        },
+    },
+    {
+        "name": "Bitterness / earthiness (JAR)",
+        "type": "select",
+        "config": {
+            "options": JAR_OPTIONS,
+            "description": "Just-About-Right scale — 3 means perfectly balanced.",
+        },
+    },
+    {
+        "name": "Off-notes detected?",
+        "type": "select",
+        "config": {"options": ["No", "Yes"]},
+    },
+    {
+        "name": "Off-notes — describe (if any)",
+        "type": "text",
+        "config": {
+            "description": "e.g. metallic, cardboard, rancid, dusty, sour, soapy",
+        },
+    },
+    {
+        "name": "Overall liking",
+        "type": "scale",
+        "config": LIKING_SCALE,
+    },
+    {
+        "name": "Comments / improvement direction",
+        "type": "text",
+        "config": {
+            "description": "Specific notes on aroma, flavor profile, finish, suggested tweaks.",
+        },
     },
 ]
+
+DEFAULT_PRODUCTS = [
+    {"name": "Coffee", "category": "coffee"},
+]
+
+
+def seed_default_attributes(product_id) -> None:
+    """Apply the standard attribute template to a product, appending after existing ones."""
+    existing = list_attributes(product_id)
+    next_order = max([a["display_order"] for a in existing], default=0) + 1
+    for attr in DEFAULT_ATTRIBUTES:
+        create_attribute(
+            product_id,
+            attr["name"],
+            attr["type"],
+            attr.get("config", {}),
+            next_order,
+        )
+        next_order += 1
 
 
 def seed_defaults() -> None:
@@ -331,5 +401,4 @@ def seed_defaults() -> None:
         return
     for product in DEFAULT_PRODUCTS:
         pid = create_product(product["name"], product.get("category"))
-        for order, attr in enumerate(product["attributes"], start=1):
-            create_attribute(pid, attr["name"], attr["type"], attr.get("config", {}), order)
+        seed_default_attributes(pid)
